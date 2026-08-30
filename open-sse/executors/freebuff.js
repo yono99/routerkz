@@ -9,6 +9,7 @@ import {
   resolveRetryEntry,
 } from "../config/runtimeConfig.js";
 import { markPoolUnfit, clearPoolUnfit } from "../services/proxyPoolFitness.js";
+import { stripNullValues } from "../utils/stripNullValues.js";
 
 /**
  * Freebuff Executor — OpenAI-compatible chat completions on
@@ -89,52 +90,12 @@ const END_TURN_TOOL = {
   },
 };
 
-// Codebuff's Freebuff backend deserializes several OpenAI-compatible numeric
-// fields as non-null u32/f64 values. Some clients use null to mean "unset";
-// forwarding that sentinel produces `invalid type: null, expected u32`.
-// Keep this cleanup narrow: null can be meaningful inside tool schemas and
-// metadata, so only known wire fields (top-level params plus the one nested
-// u32 below) are touched, never a recursive strip.
-const NULLABLE_REQUEST_PARAMS = [
-  "max_tokens",
-  "max_completion_tokens",
-  "max_output_tokens",
-  // Freebuff's Rust request schema deserializes this field as u32. Some
-  // clients send it as null when no limit was selected; omit the sentinel
-  // before JSON serialization instead of letting the upstream reject it.
-  "max_input_tokens",
-  "temperature",
-  "top_p",
-  "frequency_penalty",
-  "presence_penalty",
-  "seed",
-  "n",
-  "top_logprobs",
-  "logprobs",
-  "best_of",
-  "top_k",
-];
-
-// `tool_calls[].index` is the one u32 field inside messages: OpenAI-format
-// clients echo it back from stored streaming chunks — sometimes as null —
-// and filterToOpenAIFormat forwards assistant messages with tool_calls
-// verbatim. Freebuff's serde schema accepts a missing index but rejects an
-// explicit null, so drop only the null sentinel (a numeric index stays).
-function stripNullToolCallIndexes(body) {
-  for (const message of body?.messages || []) {
-    if (!Array.isArray(message?.tool_calls)) continue;
-    for (const toolCall of message.tool_calls) {
-      if (toolCall && toolCall.index === null) delete toolCall.index;
-    }
-  }
-  return body;
-}
-
+// See open-sse/utils/stripNullValues.js: the backend's serde schema rejects
+// explicit nulls in typed (u32/f64/...) fields anywhere in the body, so every
+// null-valued property is dropped before serialization. Array elements and
+// message `content: null` are preserved (see the util's header comment).
 function removeNullRequestParams(body) {
-  for (const field of NULLABLE_REQUEST_PARAMS) {
-    if (body[field] === null) delete body[field];
-  }
-  return stripNullToolCallIndexes(body);
+  return stripNullValues(body);
 }
 
 function injectEndTurnTool(body) {

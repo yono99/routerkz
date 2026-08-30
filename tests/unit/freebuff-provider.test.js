@@ -245,7 +245,7 @@ describe("freebuff executor wire shape", () => {
     expect(out.tools[0].function.name).toBe("end_turn");
   });
 
-  it("removes null-valued top-level numeric parameters before Freebuff serialization", () => {
+  it("strips null-valued properties anywhere in the body before Freebuff serialization", () => {
     const body = {
       model: "deepseek/deepseek-v4-flash",
       messages: [{ role: "user", content: "hi" }],
@@ -265,6 +265,17 @@ describe("freebuff executor wire shape", () => {
       top_k: null,
       user: null,
       metadata: { nullable: null },
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "bash",
+            // Tool-schema keywords are typed fields for the backend too: a
+            // null here used to slip through the old top-level-only strip.
+            parameters: { type: "object", properties: { x: { type: "string", maxLength: null } } },
+          },
+        },
+      ],
     };
     const out = __test__.removeNullRequestParams(body);
 
@@ -286,10 +297,28 @@ describe("freebuff executor wire shape", () => {
     ]) {
       expect(out).not.toHaveProperty(field);
     }
-    // Only known numeric request parameters are cleaned; unrelated fields and
-    // nested values retain their original semantics.
-    expect(out.user).toBeNull();
-    expect(out.metadata).toEqual({ nullable: null });
+    // Nulls are removed at every nesting level (metadata, tool schemas), not
+    // just at the top level.
+    expect(out.user).toBeUndefined();
+    expect(out.metadata).toEqual({});
+    expect(out.tools[0].function.parameters.properties.x).not.toHaveProperty("maxLength");
+    expect(out.tools[0].function.name).toBe("bash");
+  });
+
+  it("preserves null array elements and null message content while stripping fields", () => {
+    const body = {
+      model: "openai/gpt-5.6-luna",
+      messages: [{ role: "assistant", content: null }],
+      // A null inside a schema enum array is schema content for the model,
+      // not a request field value — it must survive the strip.
+      tools: [
+        { type: "function", function: { name: "pick", parameters: { type: "object", properties: { v: { enum: ["a", null] } } } } },
+      ],
+    };
+    const out = __test__.removeNullRequestParams(body);
+
+    expect(out.messages[0].content).toBeNull();
+    expect(out.tools[0].function.parameters.properties.v.enum).toEqual(["a", null]);
   });
 
   it("strips null tool_calls[].index sentinels from echoed assistant messages", () => {
