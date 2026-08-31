@@ -1,5 +1,13 @@
 # Unreleased
 
+## Documentation
+- **Troubleshooting**: add `docs/TROUBLESHOOTING.md` explaining why API key
+  creation returns a generic HTTP 500 when `API_KEY_SECRET` is missing or
+  shorter than 32 characters — the dev fallback secret fails its own length
+  check, and CLI/standalone instances don't read `.env` (env must come from
+  the launching process). Includes fix steps, verification, and a warning
+  against rotating the secret (invalidates all existing keys)
+
 ## Features
 - **CLI**: add background daemon mode — `routerkz --background` (alias `-b`)
   starts the gateway as a detached process with stdout/stderr appended to
