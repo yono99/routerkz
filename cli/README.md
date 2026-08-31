@@ -122,6 +122,25 @@ gateway to a detached tray supervisor and closes the console. Notes:
 - A gateway started this way (or via `--background`) survives server crashes:
   the supervisor restarts it automatically.
 
+### 🛠 Development — make `routerkz` run this repo's code
+
+On a dev machine, the global `routerkz` command can keep pointing at a stale
+published install while you edit this repo. Link them so the command always
+runs the working tree (no repack needed after edits):
+
+```bash
+cd cli
+npm link          # junction %APPDATA%\npm\node_modules\routerkz -> this folder
+```
+
+- The shims (`%APPDATA%\npm\routerkz.cmd`) keep working unchanged — they now
+  resolve through the junction to `cli.js` in this repo.
+- Roll back to a published install anytime with
+  `npm unlink -g routerkz && npm i -g routerkz`.
+- The gateway bundle under `cli/app` is still produced by `npm run build`
+  (from `cli/scripts/build-cli.js`) — link only affects which `cli.js`
+  supervises it.
+
 ### Windows clickable launcher
 
 The package includes `src/cli/windows-launcher.vbs`. After installing routerkz, copy this file to the Desktop or create a shortcut to it. Double-clicking the file starts routerkz with no console window, binds it to `127.0.0.1`, and keeps the gateway available from the notification-area tray icon.
