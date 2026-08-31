@@ -108,6 +108,20 @@ log file and the supervisor PID is recorded so you can manage the instance:
 
 **Dashboard**: `http://localhost:20128/dashboard`
 
+### 🔔 Hide to Tray
+
+Choosing **Hide to Tray (Background)** in the interactive menu hands the
+gateway to a detached tray supervisor and closes the console. Notes:
+
+- The gateway keeps running after you close the terminal (the supervisor and
+  server are detached from it).
+- Opening `routerkz` in another terminal **attaches** to the running gateway
+  instead of killing it — the menu works against it, and `Exit`/Ctrl+C there
+  leave the gateway running. Only `routerkz --stop` or the tray's Quit shut
+  it down.
+- A gateway started this way (or via `--background`) survives server crashes:
+  the supervisor restarts it automatically.
+
 ### Windows clickable launcher
 
 The package includes `src/cli/windows-launcher.vbs`. After installing routerkz, copy this file to the Desktop or create a shortcut to it. Double-clicking the file starts routerkz with no console window, binds it to `127.0.0.1`, and keeps the gateway available from the notification-area tray icon.

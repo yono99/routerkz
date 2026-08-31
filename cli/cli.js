@@ -732,16 +732,91 @@ if (!fs.existsSync(serverPath)) {
   process.exit(1);
 }
 
+// Wait until the port is free (connect refused) or the timeout elapses.
+// Used by handoff children (hide/--background) whose parent releases the port
+// just as they boot — waiting avoids burning restart cycles on EADDRINUSE.
+function waitForPortFree(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const probe = () => {
+      const socket = net.connect({ host: "127.0.0.1", port }, () => {
+        socket.destroy();
+        if (Date.now() >= deadline) return resolve(false);
+        setTimeout(probe, 250);
+      });
+      socket.on("error", () => { socket.destroy(); resolve(true); });
+    };
+    probe();
+  });
+}
+
+// True when the process LISTENING on port is one of our own gateways (same
+// whitelist killAllAppProcesses uses). A healthy instance means a new
+// interactive session should attach to it instead of sweeping it — the sweep
+// would otherwise destroy the very tray instance the user hid earlier.
+function isOurGatewayOnPort(port) {
+  return new Promise((resolve) => {
+    try {
+      if (process.platform === "win32") {
+        const netstatOut = execSync(`netstat -ano | findstr :${port}`, {
+          encoding: "utf8", shell: true, windowsHide: true, timeout: 5000
+        }).trim();
+        const listenLines = netstatOut.split("\n").filter(l => l.includes("LISTENING"));
+        if (listenLines.length === 0) return resolve(false);
+        const portPid = listenLines[0].trim().split(/\s+/).pop();
+        const psCmd = `powershell -NonInteractive -WindowStyle Hidden -Command "Get-WmiObject Win32_Process -Filter 'Name=\\"node.exe\\"' | Select-Object ProcessId,CommandLine | ConvertTo-Csv -NoTypeInformation"`;
+        const output = execSync(psCmd, { encoding: "utf8", windowsHide: true, timeout: 5000 });
+        const lines = output.split("\n").slice(1).filter(l => l.trim());
+        for (const line of lines) {
+          const m = line.match(/^"(\d+)"/);
+          if (m && m[1] === portPid) {
+            const cmd = line.toLowerCase();
+            const ours =
+              (cmd.includes("node") && cmd.includes("routerkz") && (cmd.includes("cli.js") || cmd.includes("\\routerkz") || cmd.includes("/routerkz")))
+              || cmd.includes("next-server");
+            return resolve(ours);
+          }
+        }
+        return resolve(false);
+      }
+      // macOS/Linux
+      const pidOutput = execSync(`lsof -ti:${port}`, { encoding: "utf8", timeout: 5000, stdio: ["pipe", "pipe", "ignore"] }).trim();
+      if (!pidOutput) return resolve(false);
+      const portPid = pidOutput.split("\n")[0];
+      const output = execSync("ps aux 2>/dev/null", { encoding: "utf8", timeout: 5000 });
+      const line = output.split("\n").find(l => l.trim().split(/\s+/)[1] === portPid);
+      if (!line) return resolve(false);
+      const cmd = line.toLowerCase();
+      const ours =
+        (cmd.includes("node") && cmd.includes("routerkz") && (cmd.includes("cli.js") || cmd.includes("/routerkz")))
+        || cmd.includes("next-server");
+      resolve(ours);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 // Start server immediately; run update check in parallel (not on the critical path).
 const updatePromise = checkForUpdate();
 if (skipSweep) {
-  // Background child: the parent already verified the port is free, so skip the
-  // kill-all sweep (it would match and kill the parent that spawned us).
-  startServer(updatePromise);
+  // Handoff child: the parent is releasing the port — wait for it instead of
+  // burning restart cycles (and the MITM-disable fallback) on EADDRINUSE.
+  waitForPortFree(port, 8000).then(() => startServer(updatePromise));
 } else {
-  killAllAppProcesses(port)
-    .then(() => killProcessOnPort(port))
-    .then(() => startServer(updatePromise));
+  isOurGatewayOnPort(port).then((ours) => {
+    if (ours) {
+      // A healthy routerkz gateway (e.g. the tray instance the user hid
+      // earlier) is already serving — attach to it. Sweeping here would
+      // force-close the hidden gateway every time routerkz is opened in a
+      // new terminal, which is exactly the reported bug.
+      startServer(updatePromise, { attach: true });
+    } else {
+      return killAllAppProcesses(port)
+        .then(() => killProcessOnPort(port))
+        .then(() => startServer(updatePromise));
+    }
+  });
 }
 
 // Show interface selection menu
@@ -792,7 +867,7 @@ async function showInterfaceMenu(latestVersion) {
 const MAX_RESTARTS = 2;
 const RESTART_RESET_MS = 30000; // Reset counter if alive > 30s
 
-function startServer(updatePromise) {
+function startServer(updatePromise, { attach = false } = {}) {
   // Accept either a Promise (parallel update check) or a resolved value.
   const latestVersionPromise = Promise.resolve(updatePromise);
   const displayHost = getDisplayHost();
@@ -833,13 +908,16 @@ function startServer(updatePromise) {
     return child;
   }
 
-  let server = spawnServer();
+  // Attach mode: the gateway belongs to another routerkz instance (e.g. the
+  // hidden tray the user started earlier). Never spawn, kill or respawn it.
+  let server = attach ? null : spawnServer();
 
   // Cleanup function - force kill server process
   let isCleaningUp = false;
   function cleanup() {
     if (isCleaningUp) return;
     isCleaningUp = true;
+    if (attach) return;
     try {
       // Kill tray if running
       try {
@@ -932,6 +1010,13 @@ function startServer(updatePromise) {
     process.removeAllListeners("SIGHUP");
     process.on("SIGHUP", () => {});
 
+    if (attach) {
+      // Another routerkz instance already owns this gateway (and its tray) —
+      // a second supervisor would only add a duplicate tray icon.
+      console.log(`\n🔔 ${pkg.name} is already running on port ${port} (owned by another instance).`);
+      process.exit(0);
+    }
+
     console.log(`\n🚀 ${pkg.name} v${pkg.version}`);
     console.log(`Server: http://${displayHost}:${port}`);
 
@@ -948,8 +1033,9 @@ function startServer(updatePromise) {
   waitServerReady(port).then(async () => {
     // Resolve parallel update check (already running); don't block server start on it.
     const latestVersion = await latestVersionPromise;
-    // Start tray icon alongside TUI
-    initTrayIcon();
+    // Start tray icon alongside TUI (skipped in attach mode — the running
+    // gateway already has its own tray / is owned by another instance)
+    if (!attach) initTrayIcon();
 
     try {
       while (true) {
@@ -978,6 +1064,15 @@ function startServer(updatePromise) {
           await startTerminalUI(port);
           // Loop continues, show menu again
         } else if (choice === "hide") {
+          if (attach) {
+            // The running gateway belongs to another instance (already hidden
+            // in the tray or started with --background). Spawning a second
+            // supervisor would just fight it over the port.
+            console.log(`\n🔔 routerkz is already running on port ${port} (owned by another instance).`);
+            console.log(`   Dashboard: http://${displayHost}:${port}/dashboard`);
+            console.log(`\n💡 This window can be closed — the gateway keeps running.\n`);
+            process.exit(0);
+          }
           const { clearScreen } = require("./src/cli/utils/display");
           clearScreen();
 
@@ -1002,10 +1097,12 @@ function startServer(updatePromise) {
             return;
           }
 
-          // Windows/Linux: spawn detached bgProcess (systray works fine in child)
+          // Windows/Linux: spawn detached bgProcess (systray works fine in child).
+          // --skip-sweep: the parent is exiting and handing the port over — a
+          // sweep here would kill the parent mid-cleanup (race) for nothing.
           console.log(`\n⏳ Starting background process... (tray icon will appear in ~3s)`);
 
-          const bgProcess = spawn(process.execPath, ["--dns-result-order=ipv4first", __filename, "--tray", "--skip-update", "-p", port.toString()], {
+          const bgProcess = spawn(process.execPath, ["--dns-result-order=ipv4first", __filename, "--tray", "--skip-update", "--skip-sweep", "-p", port.toString()], {
             detached: true,
             stdio: "ignore",
             windowsHide: true,
@@ -1042,10 +1139,13 @@ function startServer(updatePromise) {
     });
 
     server.on("close", (code) => {
-      if (isShuttingDown || code === 0) {
+      if (isShuttingDown) {
         process.exit(code || 0);
         return;
       }
+      // A clean exit (code 0) without shutdown is still a dead gateway —
+      // restart it instead of tearing the tray supervisor down with it
+      // (this is what made hide-to-tray look like a random force close).
       tryRestart(code);
     });
   }
@@ -1086,5 +1186,5 @@ function startServer(updatePromise) {
     }, delay);
   }
 
-  attachServerEvents();
+  if (!attach) attachServerEvents();
 }

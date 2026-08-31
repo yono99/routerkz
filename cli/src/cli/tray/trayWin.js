@@ -58,6 +58,9 @@ function initWinTray(options) {
   });
 
   psProcess.on("error", () => {});
+  // A write racing the PowerShell process's death must never crash the
+  // supervisor with an unhandled EPIPE — the tray is disposable, the gateway is not.
+  psProcess.stdin.on("error", () => {});
   psProcess.stderr.on("data", () => {});
 
   // Send initial menu items

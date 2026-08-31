@@ -17,6 +17,17 @@
   baseline regression gate (`tests/__baseline__/verify-no-regression.mjs`)
   now matches result paths outside CI's `/app` root so it works on dev
   machines (Windows) too
+- **CLI**: hide-to-tray no longer force-closes the hidden gateway — starting
+  `routerkz` in another terminal ran the startup kill-sweep, whose whitelist
+  matched the hidden tray supervisor and its server and killed both. A new
+  session now detects a healthy gateway already on the port and attaches to
+  it (menu works against it, "Hide" reports it's already running, exit/quit
+  leave it alive; foreign processes on the port are still swept). The hide
+  handoff also spawns the background supervisor with `--skip-sweep` and waits
+  for the port to be released instead of racing the parent's cleanup, the
+  supervisor restarts the server after a clean (code 0) exit instead of
+  tearing itself down, and duplicate tray icons are suppressed when the
+  gateway is already owned by another instance
 
 ## Documentation
 - **Troubleshooting**: add `docs/TROUBLESHOOTING.md` explaining why API key
