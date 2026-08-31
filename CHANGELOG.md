@@ -1,5 +1,12 @@
 # Unreleased
 
+## Fixes
+- **Auth**: password re-auth (database export/import on the profile page) no
+  longer rejects every password in production installs that never changed
+  their dashboard password — `verifyDashboardPassword` now falls back to
+  `INITIAL_PASSWORD` / the default password exactly like the login route
+  instead of unconditionally failing when no bcrypt hash is stored yet
+
 ## Documentation
 - **Troubleshooting**: add `docs/TROUBLESHOOTING.md` explaining why API key
   creation returns a generic HTTP 500 when `API_KEY_SECRET` is missing or

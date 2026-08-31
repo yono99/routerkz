@@ -84,10 +84,9 @@ export async function verifyDashboardPassword(password) {
   const settings = await getSettings();
   const storedHash = settings?.password;
   if (storedHash) return bcrypt.compare(password, storedHash);
-  const initialPassword = process.env.INITIAL_PASSWORD;
-  if (!initialPassword) {
-    if (process.env.NODE_ENV === "production") return false;
-    return password === DEFAULT_PASSWORD;
-  }
+  // Same fallback as the login route: until a password hash is stored, fresh
+  // installs accept the default password in every mode — rejecting it here made
+  // password re-auth permanently 401 in production with no INITIAL_PASSWORD.
+  const initialPassword = process.env.INITIAL_PASSWORD || DEFAULT_PASSWORD;
   return password === initialPassword;
 }

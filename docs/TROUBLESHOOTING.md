@@ -1,5 +1,35 @@
 # Troubleshooting
 
+## Database export/import always fails with 401 "Invalid password"
+
+**Symptom**
+
+- Profile page → Database backup: entering the correct password (the same one
+  that logs into the dashboard) still returns
+  `POST /api/settings/database 401` with `{"error":"Invalid password"}`.
+- Login itself works, and other dashboard API calls succeed.
+
+**Cause**
+
+`/api/settings/database` (export/import) asks for the password a second time
+(`x-9r-password` header / `password` body field) via
+`verifyDashboardPassword`. On a fresh install there is no stored bcrypt hash
+yet — one only exists after the password has been changed. In that state the
+function used to accept the default password in development but returned
+`false` for **every** password in production (`NODE_ENV=production`) when
+`INITIAL_PASSWORD` was unset, while the login route still accepted the default
+`123456`. Net effect: in a production install that never changed its password,
+password re-auth could never succeed.
+
+**Fix**
+
+Fixed in `src/lib/auth/dashboardSession.js` — `verifyDashboardPassword` now
+uses the same fallback as the login route (`INITIAL_PASSWORD`, else the
+default password) until a hash is stored. Rebuild the app so the fix reaches
+the running instance (`npm --prefix cli run build` refreshes `cli/app` for
+CLI/standalone launches), then restart it. Workaround without rebuilding:
+change the dashboard password once (Profile → password) so a hash is stored.
+
 ## Creating an API key fails with HTTP 500 ("Failed to create key")
 
 **Symptom**
