@@ -35,25 +35,96 @@ export function addBufferToUsage(usage) {
 
   const result = { ...usage };
 
+  // Only buffer finite numbers: `null + BUFFER_TOKENS` would invent 2000 tokens,
+  // and a string would concatenate ("120" -> "1202000"). Non-numeric values are
+  // left for filterUsageForFormat/sanitizeUsageForClient to drop or coerce.
+  const buffer = (v) => (typeof v === "number" && Number.isFinite(v) ? v + BUFFER_TOKENS : v);
+
   // Claude format
   if (result.input_tokens !== undefined) {
-    result.input_tokens += BUFFER_TOKENS;
+    result.input_tokens = buffer(result.input_tokens);
   }
 
   // OpenAI format
   if (result.prompt_tokens !== undefined) {
-    result.prompt_tokens += BUFFER_TOKENS;
+    result.prompt_tokens = buffer(result.prompt_tokens);
   }
 
   // Calculate or update total_tokens
   if (result.total_tokens !== undefined) {
-    result.total_tokens += BUFFER_TOKENS;
-  } else if (result.prompt_tokens !== undefined && result.completion_tokens !== undefined) {
+    result.total_tokens = buffer(result.total_tokens);
+  } else if (typeof result.prompt_tokens === "number" && typeof result.completion_tokens === "number") {
     // Calculate total_tokens if not exists
     result.total_tokens = result.prompt_tokens + result.completion_tokens;
   }
 
   return result;
+}
+
+// Numeric fields inside *_details objects that strict clients (Rust serde etc.)
+// deserialize as integers. Upstreams (vLLM/SGLang-style) emit e.g.
+// "prompt_tokens_details": {"cached_tokens": null}; a client parsing that fails
+// with "invalid type: null, expected u32", so known numeric keys coerce to 0
+// (OpenAI's own canonical "none" value) instead of being forwarded as null.
+const DETAIL_NUMERIC_KEYS = new Set([
+  "cached_tokens", "cache_creation_tokens", "reasoning_tokens",
+  "text_tokens", "audio_tokens", "image_tokens",
+]);
+
+const USAGE_DETAIL_KEYS = ["prompt_tokens_details", "completion_tokens_details", "input_tokens_details", "output_tokens_details"];
+
+// Return a finite number, or undefined when the value cannot be a token count.
+function coerceTokenNumber(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string" && value.trim() !== "") {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return numeric;
+  }
+  return undefined;
+}
+
+// Drop null/non-numeric entries from a usage details object; null values for
+// known numeric keys become 0. Returns undefined when nothing usable remains.
+function sanitizeUsageDetails(details) {
+  if (!details || typeof details !== "object" || Array.isArray(details)) return undefined;
+  const out = {};
+  for (const [key, value] of Object.entries(details)) {
+    if (value === null || value === undefined) {
+      if (DETAIL_NUMERIC_KEYS.has(key)) out[key] = 0;
+      continue;
+    }
+    const numeric = coerceTokenNumber(value);
+    if (numeric !== undefined) out[key] = numeric;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+// Final gate before usage reaches a client: no null (or NaN/Infinity) token
+// values may be serialized. Nulls are dropped at the top level, numeric strings
+// are coerced, and nested *_details objects are sanitized. Non-numeric scalar
+// values (e.g. the `estimated` flag or `service_tier`) pass through unchanged.
+export function sanitizeUsageForClient(usage) {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return usage;
+  const out = {};
+  for (const [key, value] of Object.entries(usage)) {
+    if (USAGE_DETAIL_KEYS.includes(key)) {
+      const details = sanitizeUsageDetails(value);
+      if (details) out[key] = details;
+      continue;
+    }
+    if (value === null || value === undefined) continue;
+    if (typeof value === "number") {
+      if (Number.isFinite(value)) out[key] = value;
+      continue;
+    }
+    if (typeof value === "string") {
+      const numeric = coerceTokenNumber(value);
+      out[key] = numeric !== undefined ? numeric : value;
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
 }
 
 export function filterUsageForFormat(usage, targetFormat) {
@@ -98,7 +169,7 @@ export function filterUsageForFormat(usage, targetFormat) {
 
   // Get fields for target format
   let fields = formatFields[targetFormat];
-  
+
   // Use same fields for similar formats
   if (targetFormat === FORMATS.GEMINI_CLI || targetFormat === FORMATS.ANTIGRAVITY) {
     fields = formatFields[FORMATS.GEMINI];
@@ -108,7 +179,9 @@ export function filterUsageForFormat(usage, targetFormat) {
     fields = formatFields.default;
   }
 
-  return pickFields(fields);
+  // Sanitize after picking so nulls (e.g. "cached_tokens": null from
+  // vLLM/SGLang-style upstreams) can never reach a client.
+  return sanitizeUsageForClient(pickFields(fields));
 }
 
 /**
@@ -132,13 +205,12 @@ export function normalizeUsage(usage) {
   assignNumber("cached_tokens", usage?.cached_tokens);
   assignNumber("reasoning_tokens", usage?.reasoning_tokens);
 
-  // Preserve nested details objects for OpenAI format forwarding
-  if (usage?.prompt_tokens_details && typeof usage.prompt_tokens_details === "object") {
-    normalized.prompt_tokens_details = usage.prompt_tokens_details;
-  }
-  if (usage?.completion_tokens_details && typeof usage.completion_tokens_details === "object") {
-    normalized.completion_tokens_details = usage.completion_tokens_details;
-  }
+  // Preserve nested details objects for OpenAI format forwarding (sanitized:
+  // provider nulls like {"cached_tokens": null} must not leak to clients)
+  const promptDetails = sanitizeUsageDetails(usage?.prompt_tokens_details);
+  if (promptDetails) normalized.prompt_tokens_details = promptDetails;
+  const completionDetails = sanitizeUsageDetails(usage?.completion_tokens_details);
+  if (completionDetails) normalized.completion_tokens_details = completionDetails;
 
   if (Object.keys(normalized).length === 0) return null;
   return normalized;

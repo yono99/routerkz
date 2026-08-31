@@ -6,6 +6,17 @@
   their dashboard password — `verifyDashboardPassword` now falls back to
   `INITIAL_PASSWORD` / the default password exactly like the login route
   instead of unconditionally failing when no bcrypt hash is stored yet
+- **Gateway**: never forward `null` token counters to clients — upstreams
+  (vLLM/SGLang-style) emit `"prompt_tokens_details": {"cached_tokens": null}`
+  / `"audio_tokens": null`, and strict serde clients (Codex, Grok CLI, …)
+  abort the whole turn with `invalid type: null, expected u32`. Usage is now
+  sanitized at every client boundary: null/NaN counters are dropped, numeric
+  strings coerced, and known numeric keys inside `*_details` objects coerce
+  to 0 (OpenAI's canonical "none" value) instead of leaking as null. The
+  usage buffer also no longer "adds" 2000 tokens to a null counter, and the
+  baseline regression gate (`tests/__baseline__/verify-no-regression.mjs`)
+  now matches result paths outside CI's `/app` root so it works on dev
+  machines (Windows) too
 
 ## Documentation
 - **Troubleshooting**: add `docs/TROUBLESHOOTING.md` explaining why API key

@@ -1,7 +1,7 @@
 import { translateResponse, initState } from "../translator/index.js";
 import { FORMATS } from "../translator/formats.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
-import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
+import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, sanitizeUsageForClient, COLORS } from "./usageTracking.js";
 import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./streamHelpers.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
@@ -144,6 +144,16 @@ export function createSSEStream(options = {}) {
                     delete choice.delta.tool_calls;
                     fieldsInjected = true;
                   }
+                }
+              }
+
+              // Never forward null token counters: strict Rust clients (Codex, Zed)
+              // fail with "invalid type: null, expected u32" on e.g. "cached_tokens": null.
+              if (parsed.usage && typeof parsed.usage === "object") {
+                const sanitizedUsage = sanitizeUsageForClient(parsed.usage);
+                if (JSON.stringify(sanitizedUsage) !== JSON.stringify(parsed.usage)) {
+                  parsed.usage = sanitizedUsage;
+                  fieldsInjected = true;
                 }
               }
 
