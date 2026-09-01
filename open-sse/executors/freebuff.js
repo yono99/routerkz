@@ -140,6 +140,33 @@ const poolLimitCooldowns = fbState.poolLimitCooldowns;
 const MODEL_LOCK_COOLDOWN_MS = 10 * 60 * 1000; // session bound to another model (~1h) — re-check every 10 min
 const POOL_LIMITED_COOLDOWN_MS = 5 * 60 * 1000; // IP tier refuses this model — try a different pool/relay
 
+// Limited-tier IP (region-gated free accounts) only serves MiMo 2.5 (live-
+// verified: "Limited free access is only available with MiMo 2.5."). When the
+// backend refuses a model on a limited IP we coerce the SAME request once to
+// this model instead of failing (freebuff-proxy parity).
+const LIMITED_FALLBACK_MODEL = "mimo/mimo-v2.5";
+
+// Anti-ban pacing (freebuff-proxy REQUEST_JITTER parity): random 0..N ms before
+// each upstream chat POST so burst traffic doesn't look machine-paced. Env is
+// read per call (not at import) so it can be tuned without a restart.
+function jitterMaxMs() {
+  const raw = Number(process.env.FREEBUFF_JITTER_MS ?? 200);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+}
+function freebuffJitter() {
+  const max = jitterMaxMs();
+  if (max <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * max)));
+}
+
+// Idle session rotation (freebuff-proxy IDLE_ROTATION_TIMEOUT parity): a cached
+// session row untouched for longer than this is evicted so the next request
+// claims a fresh row instead of riding a long-lived "zombie" session.
+function sessionIdleMs() {
+  const raw = Number(process.env.FREEBUFF_SESSION_IDLE_MS ?? 30 * 60 * 1000);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+}
+
 // Cooldown maps need pruning: expired entries are cleared on write (sweep) and
 // on read, so long-running servers don't accumulate one entry per (account,model)
 // / (proxy,model) forever.
@@ -295,6 +322,7 @@ async function requestSession(token, model, proxyOptions) {
     const entry = {
       instanceId: data.instanceId,
       expiresAt: Number.isFinite(parsedExp) ? parsedExp : Date.now() + SESSION_DEFAULT_TTL_MS,
+      lastUsedAt: Date.now(),
     };
     sessionCache.set(sessionCacheKey(token, model), entry);
     return { instanceId: data.instanceId, status: "active" };
@@ -324,13 +352,18 @@ async function requestSession(token, model, proxyOptions) {
 
 async function ensureSession(token, model, proxyOptions, force = false) {
   const key = sessionCacheKey(token, model);
-  // Lazy prune: drop stale rows so the cache never accumulates expired entries.
   const cached = sessionCache.get(key);
-  if (cached && cached.expiresAt <= Date.now()) {
-    sessionCache.delete(key);
-  }
-  if (!force && cached && cached.expiresAt > Date.now()) {
-    return { instanceId: cached.instanceId, status: "active" };
+  if (cached) {
+    const idleMs = sessionIdleMs();
+    const idleExpired = idleMs > 0 && Date.now() - (cached.lastUsedAt || 0) > idleMs;
+    // Lazy prune: drop expired rows AND rows idle past the rotation threshold,
+    // so the cache never accumulates stale entries and sessions get rotated.
+    if (cached.expiresAt <= Date.now() || idleExpired) {
+      sessionCache.delete(key);
+    } else if (!force) {
+      cached.lastUsedAt = Date.now();
+      return { instanceId: cached.instanceId, status: "active" };
+    }
   }
   if (force) {
     // Drop both the cached row and any in-flight claim so the fresh POST can't
@@ -403,6 +436,12 @@ async function finishRun(token, runId, status, proxyOptions) {
 export function resetSessionCache() {
   sessionCache.clear();
   inflight.clear();
+}
+
+// Reset cooldown maps (dipakai test — cooldown adalah state jangka pendek).
+export function resetCooldowns() {
+  modelLockCooldowns.clear();
+  poolLimitCooldowns.clear();
 }
 
 // Snapshot sizes of in-memory freebuff state (for the dashboard memory panel).
@@ -500,7 +539,7 @@ export class FreebuffExecutor extends BaseExecutor {
     // cooldown — no session claim, no run registration, no upstream spam.
     const proxyKey = proxyKeyOf(proxyOptions);
     const poolId = proxyOptions?.proxyPoolId || null;
-    const scope = `freebuff::${model}`;
+    let scope = `freebuff::${model}`;
     const lockUntil = getCooldown(modelLockCooldowns, `${token}::${model}`);
     if (lockUntil) {
       const err = new Error(`Freebuff session locked to another model — retry after ${new Date(lockUntil).toLocaleTimeString()}`);
@@ -536,6 +575,9 @@ export class FreebuffExecutor extends BaseExecutor {
     // extraCodebuffMetadata — one per run, stable across retries.
     let runId = null;
     const traceSessionId = crypto.randomUUID();
+    // Hoisted so the limited-coercion closure can reassign them.
+    let response;
+    let transformedBody;
 
     const buildBody = () => {
       const transformed = removeNullRequestParams(
@@ -565,6 +607,9 @@ export class FreebuffExecutor extends BaseExecutor {
         const mergedSignal = signal ? AbortSignal.any([signal, connectCtrl.signal]) : connectCtrl.signal;
         let response;
         try {
+          // Anti-ban pacing: random delay before each upstream POST (default
+          // 0-200ms) so chat bursts don't look machine-paced.
+          await freebuffJitter();
           response = await proxyAwareFetch(url, { method: "POST", headers, body: bodyStr, signal: mergedSignal }, proxyOptions);
         } catch (error) {
           // A caller/stream abort (AbortError) is genuine — never retry it. A
@@ -603,6 +648,54 @@ export class FreebuffExecutor extends BaseExecutor {
       finishRun(token, id, status, proxyOptions);
     };
 
+    // Limited-tier IP gate: mark the (pool, original model) pair unfit for
+    // POOL_LIMITED_COOLDOWN_MS, then try the SAME request once with the tier's
+    // only model (LIMITED_FALLBACK_MODEL — live-verified MiMo 2.5). Throws
+    // when the coerced attempt fails too, so the caller's account/pool
+    // failover moves on.
+    const coerceLimitedModel = async (gate) => {
+      const until = Date.now() + POOL_LIMITED_COOLDOWN_MS;
+      setCooldown(poolLimitCooldowns, `${proxyKey}::${model}`, until);
+      if (poolId) markPoolUnfit(poolId, `freebuff::${model}`, until, "limited_ip");
+      if (LIMITED_FALLBACK_MODEL === model) {
+        throwSessionGateError(gate, { token, model, proxyKey, poolId, log });
+      }
+      const coerced = LIMITED_FALLBACK_MODEL;
+      log?.warn?.("AUTH", `Freebuff limited-IP refused ${model} — coercing once to ${coerced} (pool cooldown ${POOL_LIMITED_COOLDOWN_MS / 60000}min)`);
+      try {
+        session = await ensureSession(token, coerced, proxyOptions, true);
+        runId = await startRun(token, coerced, proxyOptions);
+        activeRunId = runId;
+        model = coerced;
+        scope = `freebuff::${coerced}`;
+        body = { ...body, model: coerced };
+        ({ response, transformedBody } = await doChat());
+      } catch (error) {
+        const gate2 = sessionGateFromError(error);
+        if (gate2) throwSessionGateError(gate2, { token, model: coerced, proxyKey, poolId, log });
+        throw error;
+      }
+      if (SESSION_STALE_CODES.has(response.status)) {
+        const text = await response.text().catch(() => "");
+        const gate2 = sessionGateFromText(text);
+        if (gate2) throwSessionGateError(gate2, { token, model: coerced, proxyKey, poolId, log });
+        const err = new Error(`Freebuff limited fallback (${coerced}) refused (${response.status}): ${text.slice(0, 160)}`);
+        err.status = response.status;
+        throw err;
+      }
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        const err = new Error(`Freebuff limited fallback (${coerced}) failed: ${response.status} ${text.slice(0, 160)}`);
+        err.status = response.status;
+        throw err;
+      }
+      // Koersi sukses — pasangan (pool, model koersi) sehat; cooldown model
+      // ASLI pada pool ini tetap berlaku (di-set di atas).
+      modelLockCooldowns.delete(`${token}::${coerced}`);
+      poolLimitCooldowns.delete(`${proxyKey}::${coerced}`);
+      if (poolId) clearPoolUnfit(poolId, `freebuff::${coerced}`);
+    };
+
     try {
       try {
         runId = await startRun(token, model, proxyOptions);
@@ -612,7 +705,9 @@ export class FreebuffExecutor extends BaseExecutor {
         throw error;
       }
 
-      let { response, transformedBody } = await doChat();
+      let { response: initialResponse, transformedBody: initialBody } = await doChat();
+      response = initialResponse;
+      transformedBody = initialBody;
 
       // Session gates that mean our claimed session is stale/absent:
       //   428 waiting_room_required — no session row / instance id missing
@@ -625,36 +720,45 @@ export class FreebuffExecutor extends BaseExecutor {
       if (SESSION_STALE_CODES.has(response.status)) {
         const text = await response.text().catch(() => "");
         const gate = sessionGateFromText(text);
-        if (gate.kind === "model_locked" || gate.kind === "limited_ip") {
+        if (gate.kind === "model_locked") {
           markFinished("cancelled");
           throwSessionGateError(gate, { token, model, proxyKey, poolId, log });
         }
-
-        log?.debug?.("AUTH", `Freebuff ${response.status} session gate — re-claiming session`);
-        markFinished("cancelled");
-        try {
-          session = await ensureSession(token, model, proxyOptions, true);
-          runId = await startRun(token, model, proxyOptions);
-          activeRunId = runId;
-        } catch (error) {
-          const gate2 = sessionGateFromError(error);
-          if (gate2) throwSessionGateError(gate2, { token, model, proxyKey, poolId, log });
-          log?.error?.("AUTH", `Freebuff session re-claim failed: ${error.message}`);
-          throw error;
-        }
-        ({ response, transformedBody } = await doChat());
-
-        if (SESSION_STALE_CODES.has(response.status)) {
-          const text2 = await response.text().catch(() => "");
-          const gate3 = sessionGateFromText(text2);
-          if (gate3.kind === "model_locked" || gate3.kind === "limited_ip") {
-            throwSessionGateError(gate3, { token, model, proxyKey, poolId, log });
+        if (gate.kind === "limited_ip") {
+          markFinished("cancelled");
+          await coerceLimitedModel(gate); // throws bila koersi gagal; sukses → lanjut
+        } else {
+          log?.debug?.("AUTH", `Freebuff ${response.status} session gate — re-claiming session`);
+          markFinished("cancelled");
+          try {
+            session = await ensureSession(token, model, proxyOptions, true);
+            runId = await startRun(token, model, proxyOptions);
+            activeRunId = runId;
+          } catch (error) {
+            const gate2 = sessionGateFromError(error);
+            if (gate2) throwSessionGateError(gate2, { token, model, proxyKey, poolId, log });
+            log?.error?.("AUTH", `Freebuff session re-claim failed: ${error.message}`);
+            throw error;
           }
-          const err = new Error(
-            `Freebuff session gate refused (${response.status}) — another freebuff instance may be holding the session. ${text2.slice(0, 160)}`,
-          );
-          err.status = response.status;
-          throw err;
+          ({ response, transformedBody } = await doChat());
+
+          if (SESSION_STALE_CODES.has(response.status)) {
+            const text2 = await response.text().catch(() => "");
+            const gate3 = sessionGateFromText(text2);
+            if (gate3.kind === "model_locked") {
+              throwSessionGateError(gate3, { token, model, proxyKey, poolId, log });
+            }
+            if (gate3.kind === "limited_ip") {
+              markFinished("cancelled");
+              await coerceLimitedModel(gate3); // throws bila koersi gagal
+            } else {
+              const err = new Error(
+                `Freebuff session gate refused (${response.status}) — another freebuff instance may be holding the session. ${text2.slice(0, 160)}`,
+              );
+              err.status = response.status;
+              throw err;
+            }
+          }
         }
       }
 
@@ -693,12 +797,18 @@ export const __test__ = {
   requestSession,
   startRun,
   resetSessionCache,
+  resetCooldowns,
   rootAgentIdForModel,
   injectFreebuffMarker,
   injectEndTurnTool,
   removeNullRequestParams,
   fetchWithNetworkRetry,
+  freebuffJitter,
+  jitterMaxMs,
+  sessionIdleMs,
+  classifySessionGate,
   FREEBUFF_SYSTEM_MARKER,
+  LIMITED_FALLBACK_MODEL,
   SESSION_STALE_CODES,
 };
 

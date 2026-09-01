@@ -14,8 +14,11 @@ const {
   requestSession,
   startRun,
   resetSessionCache,
+  resetCooldowns,
   rootAgentIdForModel,
   injectFreebuffMarker,
+  freebuffJitter,
+  LIMITED_FALLBACK_MODEL,
   FREEBUFF_SYSTEM_MARKER,
 } = __test__;
 
@@ -36,11 +39,15 @@ function jsonResponse(data, { ok = true, status = 200 } = {}) {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 beforeEach(() => {
   fetchMock.mockReset();
   resetSessionCache();
+  resetCooldowns();
+  // Keep existing tests fast/deterministic; jitter-specific tests stub their own env.
+  vi.stubEnv("FREEBUFF_JITTER_MS", "0");
 });
 
 describe("freebuff oauth flow", () => {
@@ -770,5 +777,144 @@ describe("freebuff executor parseError", () => {
     expect(parsed.status).toBe(500);
     expect(parsed.message).toContain("bad");
     expect(parsed.resetsAtMs).toBeUndefined();
+  });
+});
+
+describe("freebuff request jitter (anti-ban pacing)", () => {
+  it("delays a random 0..max ms when FREEBUFF_JITTER_MS is set", async () => {
+    vi.stubEnv("FREEBUFF_JITTER_MS", "80");
+    vi.spyOn(Math, "random").mockReturnValue(0.5); // → 40ms
+    const started = Date.now();
+    await freebuffJitter();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(30);
+    vi.restoreAllMocks();
+  });
+
+  it("resolves immediately when jitter is disabled", async () => {
+    vi.stubEnv("FREEBUFF_JITTER_MS", "0");
+    const started = Date.now();
+    await freebuffJitter();
+    expect(Date.now() - started).toBeLessThan(20);
+  });
+});
+
+describe("freebuff session idle rotation", () => {
+  const SESSION_URL = "https://www.codebuff.com/api/v1/freebuff/session";
+  const MODEL = "deepseek/deepseek-v4-flash";
+
+  it("re-claims a session when the cached row has been idle past the threshold", async () => {
+    vi.stubEnv("FREEBUFF_SESSION_IDLE_MS", "10");
+    fetchMock.mockResolvedValue(
+      jsonResponse({ status: "active", instanceId: "inst-1", expiresAt: new Date(Date.now() + 3600000).toISOString() }),
+    );
+    await ensureSession("tok-idle", MODEL, null);
+    expect(fetchMock.mock.calls.filter(([u]) => u.includes("/freebuff/session")).length).toBe(1);
+    await new Promise((r) => setTimeout(r, 30)); // melewati ambang idle 10ms
+    await ensureSession("tok-idle", MODEL, null);
+    expect(fetchMock.mock.calls.filter(([u]) => u.includes("/freebuff/session")).length).toBe(2);
+  });
+
+  it("reuses the cached session when used within the idle threshold", async () => {
+    vi.stubEnv("FREEBUFF_SESSION_IDLE_MS", "60000");
+    fetchMock.mockResolvedValue(
+      jsonResponse({ status: "active", instanceId: "inst-1", expiresAt: new Date(Date.now() + 3600000).toISOString() }),
+    );
+    await ensureSession("tok-reuse", MODEL, null);
+    await ensureSession("tok-reuse", MODEL, null);
+    expect(fetchMock.mock.calls.filter(([u]) => u.includes("/freebuff/session")).length).toBe(1);
+  });
+});
+
+describe("freebuff limited-tier model coercion", () => {
+  const CHAT_URL = "https://www.codebuff.com/api/v1/chat/completions";
+  const SESSION_URL = "https://www.codebuff.com/api/v1/freebuff/session";
+  const RUN_URL = "https://www.codebuff.com/api/v1/agent-runs";
+  const MODEL = "deepseek/deepseek-v4-flash";
+  const credentials = { accessToken: "tok-1", providerSpecificData: { fingerprintId: "fp-1" } };
+
+  it("coerces to mimo/mimo-v2.5 ONCE when chat 409s with the limited-tier message", async () => {
+    let chatHits = 0;
+    fetchMock.mockImplementation(async (url) => {
+      if (url === SESSION_URL) {
+        return jsonResponse({ status: "active", instanceId: "inst-mimo", expiresAt: new Date(Date.now() + 3600000).toISOString() });
+      }
+      if (url === RUN_URL) {
+        return jsonResponse({ runId: "run-mimo" });
+      }
+      chatHits += 1;
+      if (chatHits === 1) {
+        return jsonResponse(
+          { error: "session_model_mismatch", message: "Limited free access is only available with MiMo 2.5." },
+          { status: 409, ok: false },
+        );
+      }
+      return jsonResponse({ choices: [{ message: { content: "ok" } }] });
+    });
+
+    const ex = new FreebuffExecutor();
+    const body = { model: MODEL, messages: [{ role: "user", content: "hi" }] };
+    const { response } = await ex.execute({ model: MODEL, body, stream: false, credentials, log: null });
+
+    expect(response.status).toBe(200);
+    expect(chatHits).toBe(2);
+    const chatCalls = fetchMock.mock.calls.filter(([u]) => u === CHAT_URL);
+    expect(chatCalls.length).toBe(2);
+    // Attempt kedua memakai model koersi + session/run milik model koersi.
+    const coerced = JSON.parse(chatCalls[1][1].body);
+    expect(coerced.model).toBe(LIMITED_FALLBACK_MODEL);
+    expect(coerced.codebuff_metadata.run_id).toBe("run-mimo");
+    expect(coerced.codebuff_metadata.freebuff_instance_id).toBe("inst-mimo");
+    // Attempt pertama memakai model asli.
+    expect(JSON.parse(chatCalls[0][1].body).model).toBe(MODEL);
+  });
+
+  it("does not coerce when the requested model IS the limited fallback (mimo)", async () => {
+    let chatHits = 0;
+    fetchMock.mockImplementation(async (url) => {
+      if (url === SESSION_URL) {
+        return jsonResponse({ status: "active", instanceId: "inst-mimo", expiresAt: new Date(Date.now() + 3600000).toISOString() });
+      }
+      if (url === RUN_URL) {
+        return jsonResponse({ runId: "run-mimo" });
+      }
+      chatHits += 1;
+      return jsonResponse(
+        { error: "session_model_mismatch", message: "Limited free access is only available with MiMo 2.5." },
+        { status: 409, ok: false },
+      );
+    });
+
+    const ex = new FreebuffExecutor();
+    const body = { model: LIMITED_FALLBACK_MODEL, messages: [{ role: "user", content: "hi" }] };
+    await expect(
+      ex.execute({ model: LIMITED_FALLBACK_MODEL, body, stream: false, credentials, log: null }),
+    ).rejects.toThrow(/limited-mode IP rejected/i);
+
+    expect(chatHits).toBe(1); // sekali saja — tidak ada koersi loop
+  });
+
+  it("throws the pool-scoped gate when the coerced attempt also fails", async () => {
+    let chatHits = 0;
+    fetchMock.mockImplementation(async (url) => {
+      if (url === SESSION_URL) {
+        return jsonResponse({ status: "active", instanceId: "inst-mimo", expiresAt: new Date(Date.now() + 3600000).toISOString() });
+      }
+      if (url === RUN_URL) {
+        return jsonResponse({ runId: "run-mimo" });
+      }
+      chatHits += 1;
+      return jsonResponse(
+        { error: "session_model_mismatch", message: "Limited free access is only available with MiMo 2.5." },
+        { status: 409, ok: false },
+      );
+    });
+
+    const ex = new FreebuffExecutor();
+    const body = { model: MODEL, messages: [{ role: "user", content: "hi" }] };
+    await expect(
+      ex.execute({ model: MODEL, body, stream: false, credentials, log: null }),
+    ).rejects.toThrow(/limited-mode IP rejected/i);
+
+    expect(chatHits).toBe(2); // asli + koersi, lalu terminal
   });
 });
