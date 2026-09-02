@@ -454,11 +454,19 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       streamController.handleError(error);
       return createErrorResult(499, "Request aborted");
     }
-    const errMsg = formatProviderError(error, provider, model, HTTP_STATUS.BAD_GATEWAY);
+    // Executors classify upstream refusals with err.status (403 banned,
+    // 429 rate-limited, 409 model-locked, …). Surface the real code instead
+    // of folding every thrown error into a 502 — otherwise the account
+    // fallback loop locks the wrong window and re-contacts a dead or
+    // quota-exhausted account on a ~30s transient cooldown.
+    const throwStatus = error?.status && error.status >= 400 && error.status <= 599
+      ? error.status
+      : HTTP_STATUS.BAD_GATEWAY;
+    const errMsg = formatProviderError(error, provider, model, throwStatus);
     if (log?.errorLine) {
-      log.errorLine(reqTag, "✗", `ERROR 502 · ${provider}/${model} · ${Date.now() - requestStartTime}ms\n    ${errMsg}`);
+      log.errorLine(reqTag, "✗", `ERROR ${throwStatus} · ${provider}/${model} · ${Date.now() - requestStartTime}ms\n    ${errMsg}`);
     }
-    return createErrorResult(HTTP_STATUS.BAD_GATEWAY, errMsg, error?.resetsAtMs || undefined);
+    return createErrorResult(throwStatus, errMsg, error?.resetsAtMs || undefined);
   }
 
   // Handle 401/403 - try token refresh (skip for noAuth providers)

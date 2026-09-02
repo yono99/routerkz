@@ -5,6 +5,30 @@ import { getStatusVariant as getConnectionStatusVariant } from "@/shared/utils/c
 import PropTypes from "prop-types";
 import { Card, Badge, Button, Modal, Select, Toggle, EditConnectionModal, ConfirmModal } from "@/shared/components";
 
+// How recent a selection must be for the account to count as "currently in
+// use". Longer than the backend's IN_USE_RECORD_INTERVAL_MS (15s) so an
+// active conversation keeps the badge without flickering between turns.
+const IN_USE_WINDOW_MS = 2 * 60 * 1000;
+const IN_USE_POLL_MS = 5000;
+
+// The "currently in use" account = the active connection selected most
+// recently (the backend stamps lastUsedAt on selection). Only meaningful
+// when more than one account is active, and only while traffic is recent —
+// otherwise null (no badge). Called from async data callbacks, never during
+// render (Date.now is impure).
+function computeInUseId(connections) {
+  const active = connections.filter((c) => c.isActive !== false);
+  if (active.length <= 1) return null;
+  const now = Date.now();
+  let best = null;
+  for (const c of active) {
+    const t = c.lastUsedAt ? new Date(c.lastUsedAt).getTime() : 0;
+    if (!t || now - t > IN_USE_WINDOW_MS) continue;
+    if (!best || t > best.t) best = { id: c.id, t };
+  }
+  return best ? best.id : null;
+}
+
 // ── CooldownTimer ──────────────────────────────────────────────
 function CooldownTimer({ until }) {
   const [remaining, setRemaining] = useState("");
@@ -30,7 +54,7 @@ function CooldownTimer({ until }) {
 CooldownTimer.propTypes = { until: PropTypes.string.isRequired };
 
 // ── ConnectionRow ──────────────────────────────────────────────
-function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMoveUp, onMoveDown, onToggleActive, onUpdateProxy, onEdit, onDelete }) {
+function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMoveUp, onMoveDown, onToggleActive, onUpdateProxy, onEdit, onDelete, isInUse = false }) {
   const [showProxyDropdown, setShowProxyDropdown] = useState(false);
   const [updatingProxy, setUpdatingProxy] = useState(false);
   const [isCooldown, setIsCooldown] = useState(false);
@@ -117,6 +141,11 @@ function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMov
             <Badge variant={getStatusVariant()} size="sm" dot>
               {connection.isActive === false ? "disabled" : (effectiveStatus || "Unknown")}
             </Badge>
+            {isInUse && connection.isActive !== false && (
+              <span title="Account yang sedang dipakai — terakhir terpilih untuk melayani request">
+                <Badge variant="primary" size="sm" dot>In Use</Badge>
+              </span>
+            )}
             {hasAnyProxy && <Badge variant={proxyBadgeVariant} size="sm">Proxy</Badge>}
             {isCooldown && connection.isActive !== false && <CooldownTimer until={modelLockUntil} />}
             {connection.lastError && connection.isActive !== false && (
@@ -191,6 +220,7 @@ ConnectionRow.propTypes = {
   onUpdateProxy: PropTypes.func,
   onEdit: PropTypes.func.isRequired,
   onDelete: PropTypes.func.isRequired,
+  isInUse: PropTypes.bool,
 };
 
 // ── AddApiKeyModal ─────────────────────────────────────────────
@@ -304,6 +334,7 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
   const [selectedConnection, setSelectedConnection] = useState(null);
   const [providerStrategy, setProviderStrategy] = useState(null);
   const [providerStickyLimit, setProviderStickyLimit] = useState("1");
+  const [inUseId, setInUseId] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
 
   const fetch_ = useCallback(async () => {
@@ -316,7 +347,11 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
       const connData = await connRes.json();
       const proxyData = await proxyRes.json();
       const settingsData = settingsRes.ok ? await settingsRes.json() : {};
-      if (connRes.ok) setConnections((connData.connections || []).filter((c) => c.provider === providerId));
+      if (connRes.ok) {
+        const scoped = (connData.connections || []).filter((c) => c.provider === providerId);
+        setConnections(scoped);
+        setInUseId(computeInUseId(scoped));
+      }
       if (proxyRes.ok) setProxyPools(proxyData.proxyPools || []);
       const override = (settingsData.providerStrategies || {})[providerId] || {};
       setProviderStrategy(override.fallbackStrategy || null);
@@ -326,6 +361,24 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
   }, [providerId]);
 
   useEffect(() => { fetch_(); }, [fetch_]);
+
+  // Live "In Use" badge: poll connections while the page is open so the
+  // marker follows account failover (429 lock → next healthy account).
+  // setState only happens in the interval callback, never in the effect body.
+  useEffect(() => {
+    const t = setInterval(async () => {
+      try {
+        const res = await fetch("/api/providers", { cache: "no-store" });
+        if (res.ok) {
+          const d = await res.json();
+          const scoped = (d.connections || []).filter((c) => c.provider === providerId);
+          setConnections(scoped);
+          setInUseId(computeInUseId(scoped));
+        }
+      } catch { /* keep last state on transient errors */ }
+    }, IN_USE_POLL_MS);
+    return () => clearInterval(t);
+  }, [providerId]);
 
   const saveStrategy = async (strategy, stickyLimit) => {
     try {
@@ -447,6 +500,7 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
                   onMoveDown={() => handleSwapPriority(idx, idx + 1)}
                   onToggleActive={(isActive) => handleToggleActive(conn.id, isActive)}
                   onUpdateProxy={(poolId) => handleUpdateProxy(conn.id, poolId)}
+                  isInUse={conn.id === inUseId}
                   onEdit={() => { setSelectedConnection(conn); setShowEditModal(true); }}
                   onDelete={() => handleDelete(conn.id)}
                 />

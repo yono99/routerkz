@@ -28,6 +28,24 @@
   supervisor restarts the server after a clean (code 0) exit instead of
   tearing itself down, and duplicate tray icons are suppressed when the
   gateway is already owned by another instance
+- **Freebuff anti-ban**: session gates now carry a real HTTP status and reset
+  window instead of surfacing as transient 502s — `banned` → 403 locked for
+  ~30 days (terminal until an operator rechecks), `rate_limited` /
+  `spend_limited` → 429 locked until the Pacific-midnight quota reset (new
+  `nextPacificMidnightMs` helper), `country_blocked` → 403 / 15 min,
+  `ip_capped` → 429 / 5 min, `model_locked` → 409 / 10 min, transient model
+  states → 429 / 2 min. Previously every gate was an unclassified error and
+  the account fallback loop re-contacted dead or quota-exhausted accounts
+  every ~30 s. `chatCore` also passes executor-thrown statuses (403/429/409)
+  through to clients and the fallback classifier instead of folding all of
+  them into 502
+- **Freebuff rotation safety**: the provider now ignores the global
+  round-robin setting (multi-account rotation is an upstream ban signal);
+  Fill-First is pinned unless an explicit freebuff-specific override exists.
+  Freebuff account locks may now exceed the generic 30-minute cap (up to ~31
+  days) so the midnight quota window is honored instead of being truncated,
+  and the account selection loop stamps `lastUsedAt` on each pick for the
+  dashboard (throttled to one write per 15 s, fire-and-forget)
 
 ## Documentation
 - **Troubleshooting**: add `docs/TROUBLESHOOTING.md` explaining why API key
@@ -44,6 +62,12 @@
   records the supervisor PID in `routerkz.pid`. New `--status` and `--stop`
   flags report on / shut down the instance; quitting via tray or Ctrl+C also
   cleans up the PID file
+- **Dashboard**: Connections now shows an "In Use" badge on the account last
+  selected to serve a request (backed by the `lastUsedAt` selection stamp).
+  The card polls every 5 s while open, so the badge follows failover live:
+  when the active account hits its daily quota it locks until Pacific
+  midnight and the badge moves to the next healthy account — visible
+  only when more than one account is active and traffic is recent
 
 # v0.5.55 (2026-08-14)
 

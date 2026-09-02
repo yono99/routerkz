@@ -22,6 +22,18 @@ export function filterConnectionsForModel(providerId, connections, model, settin
 
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
 
+// FreeBuff lock ceiling: the generic MAX_RATE_LIMIT_COOLDOWN_MS (30 min)
+// would truncate a Pacific-midnight quota lock, so a quota-exhausted account
+// would be re-contacted every 30 minutes all day. The freebuff executor owns
+// its resetsAtMs values, so bound them to ~31 days instead (banned accounts
+// stay locked until an operator re-checks them).
+const FREE_MAX_LOCK_MS = 31 * 24 * 60 * 60 * 1000;
+
+// How often a selected account's lastUsedAt stamp may be persisted (ms).
+// Monitoring freshness for the dashboard "in use" badge — not a per-request
+// DB write on every request of a busy gateway.
+const IN_USE_RECORD_INTERVAL_MS = 15 * 1000;
+
 function githubMonthlyResetMs(status, errorText, provider) {
   if (resolveProviderId(provider) !== "github" || Number(status) !== 402) return null;
   if (!String(errorText || "").toLowerCase().includes(GITHUB_MONTHLY_USAGE_LIMIT)) return null;
@@ -141,8 +153,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       return null;
     }
 
-    // Per-provider strategy overrides global setting
-    const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
+    // Per-provider strategy overrides global setting. FreeBuff free-tier
+    // accounts are ban-sensitive: multi-account round-robin triggers upstream
+    // anti-farm detection, so a global round-robin must never rotate them.
+    // An explicit freebuff-specific override still wins.
+    let strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
+    if (providerId === "freebuff" && !providerOverride.fallbackStrategy) {
+      strategy = "fill-first";
+    }
 
     let connection;
     // Pin to preferred connection if specified and available
@@ -196,6 +214,19 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     } else {
       // Default: fill-first (already sorted by priority in getProviderConnections)
       connection = availableConnections[0];
+    }
+
+    // Monitoring: stamp which account was selected so the dashboard can badge
+    // the "currently in use" account (and show it move when a 429 lock fails
+    // over to the next healthy one). Throttled to ≤1 write per account per
+    // interval, fire-and-forget so selection never waits on it. Round-robin
+    // already persists lastUsedAt on every pick — skip the duplicate write.
+    if (connection && strategy !== "round-robin") {
+      const lastUsedMs = connection.lastUsedAt ? new Date(connection.lastUsedAt).getTime() : 0;
+      if (!lastUsedMs || Date.now() - lastUsedMs > IN_USE_RECORD_INTERVAL_MS) {
+        const stamp = new Date().toISOString();
+        updateProviderConnection(connection.id, { lastUsedAt: stamp }).catch(() => { });
+      }
     }
 
     // Scope the region-aware picker to this provider/model (e.g. freebuff::gpt-5.6-luna)
@@ -266,7 +297,11 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     newBackoffLevel = 0;
   } else if (resetsAtMs && resetsAtMs > Date.now()) {
     shouldFallback = true;
-    cooldownMs = Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
+    // FreeBuff quota/spend windows reset at Pacific midnight and can exceed
+    // the 30-min generic cap by hours (see FREE_MAX_LOCK_MS above); the
+    // freebuff executor owns resetsAtMs, so use the wider bound there.
+    const capMs = resolveProviderId(provider) === "freebuff" ? FREE_MAX_LOCK_MS : MAX_RATE_LIMIT_COOLDOWN_MS;
+    cooldownMs = Math.min(resetsAtMs - Date.now(), capMs);
     newBackoffLevel = 0;
   } else {
     ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel));

@@ -167,6 +167,34 @@ function sessionIdleMs() {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
 }
 
+// Next 00:00 Pacific in epoch ms (freebuff-proxy NextPacificMidnight parity):
+// the free tier's per-model daily quota and spend ceilings reset at Pacific
+// midnight, so a quota-dead (account, model) pair must stay locked until then
+// instead of being re-contacted every few minutes. The LA UTC offset is read
+// from the IANA tzdb via Intl when available; a month-range approximation
+// (UTC-7 Mar–Nov / UTC-8 otherwise) is the fallback when it is not.
+function nextPacificMidnightMs(now = Date.now()) {
+  try {
+    const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", timeZoneName: "longOffset" });
+    const off = fmt.formatToParts(new Date(now)).find((p) => p.type === "timeZoneName")?.value || "";
+    const m = /GMT([+-])(\d{2}):(\d{2})/.exec(off); // e.g. "GMT-07:00" (PDT) / "GMT-08:00" (PST)
+    if (m) {
+      const sign = m[1] === "-" ? -1 : 1;
+      const offsetMin = sign * (Number(m[2]) * 60 + Number(m[3])); // LA is west of UTC → negative
+      const d = new Date(now);
+      // LA midnight == next UTC midnight shifted by the offset magnitude:
+      // offset -07:00 → 00:00 LA = 07:00 UTC of the next UTC day.
+      return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - offsetMin * 60_000;
+    }
+  } catch {
+    // fall through to the approximation below
+  }
+  const d = new Date(now);
+  const hour = d.getUTCMonth() >= 2 && d.getUTCMonth() <= 10 ? 7 : 8; // PDT Mar–Nov, else PST
+  const t = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), hour);
+  return t > now ? t : t + 24 * 60 * 60 * 1000;
+}
+
 // Cooldown maps need pruning: expired entries are cleared on write (sweep) and
 // on read, so long-running servers don't accumulate one entry per (account,model)
 // / (proxy,model) forever.
@@ -345,7 +373,42 @@ async function requestSession(token, model, proxyOptions) {
   };
   if (GATE_MESSAGES[status]) {
     const message = data?.message ? `${GATE_MESSAGES[status]} ${data.message}` : GATE_MESSAGES[status];
-    throw new Error(message);
+    const err = new Error(message);
+    // Classify the gate (freebuff-proxy parity) so the account-selection loop
+    // locks the right (account, model) window instead of re-contacting a
+    // dead or quota-exhausted account every ~30s. Without status/resetsAtMs
+    // the error would surface as a 502 transient and be retried immediately.
+    switch (status) {
+      case "banned": // account dead upstream — terminal until an operator re-checks it
+        err.status = 403;
+        err.resetsAtMs = Date.now() + 30 * 24 * 60 * 60 * 1000;
+        break;
+      case "country_blocked": // region/egress issue — re-probe occasionally
+        err.status = 403;
+        err.resetsAtMs = Date.now() + 15 * 60 * 1000;
+        break;
+      case "rate_limited": // per-model daily quota — resets at Pacific midnight
+      case "spend_limited": // spend ceiling — server-enforced until the window resets
+        err.status = 429;
+        err.resetsAtMs = nextPacificMidnightMs();
+        break;
+      case "ip_capped": // egress IP capped — short window, account still healthy
+        err.status = 429;
+        err.resetsAtMs = Date.now() + POOL_LIMITED_COOLDOWN_MS;
+        break;
+      case "model_locked": // session bound to another model (~1h) — re-check later
+        err.status = 409;
+        err.resetsAtMs = Date.now() + MODEL_LOCK_COOLDOWN_MS;
+        break;
+      case "model_unavailable": // transient upstream state — brief backoff
+      case "premium_slot_taken":
+        err.status = 429;
+        err.resetsAtMs = Date.now() + 2 * 60 * 1000;
+        break;
+      default:
+        break;
+    }
+    throw err;
   }
   throw new Error(`Freebuff session rejected (${status || response.status}): ${JSON.stringify(data).slice(0, 200)}`);
 }
@@ -806,6 +869,7 @@ export const __test__ = {
   freebuffJitter,
   jitterMaxMs,
   sessionIdleMs,
+  nextPacificMidnightMs,
   classifySessionGate,
   FREEBUFF_SYSTEM_MARKER,
   LIMITED_FALLBACK_MODEL,
